@@ -122,8 +122,14 @@ def _humanize(err_text: str) -> str:
     if "http error 429" in low or "too many requests" in low:
         return ("YouTube временно ограничил запросы (429). Подожди 10–15 минут "
                 "или задай прокси через YT_PROXY.")
+    if "requested format is not available" in low or "no video formats" in low:
+        return ("YouTube не отдал видео в нужном формате — обычно это блокировка "
+                "серверного IP (нужны свежие cookies или прокси YT_PROXY).")
+    # Общий случай: показываем короткий кусок настоящей ошибки, чтобы было видно причину.
+    snippet = " ".join(err_text.split())[-300:]
     return ("Не удалось скачать видео. Возможные причины: устаревшие cookies, "
-            "блокировка YouTube или недоступность видео. Технические детали в логах.")
+            "блокировка YouTube или недоступность видео.\n\n"
+            f"Техническая причина: {snippet}")
 
 
 def download(url: str, workdir: str, cfg: Config) -> DownloadResult:
@@ -135,6 +141,7 @@ def download(url: str, workdir: str, cfg: Config) -> DownloadResult:
         with yt_dlp.YoutubeDL({**opts, "skip_download": True}) as ydl:
             info = ydl.extract_info(url, download=False)
     except yt_dlp.utils.DownloadError as exc:
+        log.warning("yt-dlp ошибка (extract_info): %s", exc)
         raise DownloadError(_humanize(str(exc))) from exc
     except Exception as exc:  # noqa: BLE001
         log.exception("Непредвиденная ошибка при extract_info")
@@ -159,6 +166,7 @@ def download(url: str, workdir: str, cfg: Config) -> DownloadResult:
             info = ydl.extract_info(url, download=True)
             path = ydl.prepare_filename(info)
     except yt_dlp.utils.DownloadError as exc:
+        log.warning("yt-dlp ошибка (download): %s", exc)
         raise DownloadError(_humanize(str(exc))) from exc
     except Exception as exc:  # noqa: BLE001
         log.exception("Непредвиденная ошибка при скачивании")
