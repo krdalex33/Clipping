@@ -22,6 +22,12 @@ MAX_LEN = 60.0
 # Небольшой допуск: модель редко попадает секунда-в-секунду.
 LEN_TOLERANCE = 8.0
 
+# Бюджет транскрипта, отправляемого в LLM (символов). У Groq на бесплатном тарифе
+# есть лимит токенов на один запрос; при превышении он отвечает 413. Длинное видео
+# даёт огромный транскрипт, поэтому мы его прореживаем под бюджет, а при 413 —
+# ужимаем ещё сильнее и повторяем.
+MAX_LLM_CHARS = 12000
+
 
 class SelectError(RuntimeError):
     def __init__(self, user_message: str):
@@ -29,24 +35,48 @@ class SelectError(RuntimeError):
         self.user_message = user_message
 
 
-def _build_timestamped_text(words: list[Word], line_gap: float = 6.0) -> str:
-    """Собрать компактный транскрипт: строки вида [start-end] текст."""
+def _lines(words: list[Word], seg_seconds: float, max_words: int) -> list[str]:
+    """Разбить слова на блоки ~seg_seconds, в каждом — не более max_words слов.
+
+    Формат строки: [start-end] текст. Ограничение max_words прореживает длинные
+    блоки (для длинных видео), сохраняя таймкоды-ориентиры для выбора моментов.
+    """
     if not words:
-        return ""
-    lines: list[str] = []
+        return []
+    out: list[str] = []
     buf: list[str] = []
     line_start = words[0].start
     line_end = words[0].end
     for w in words:
-        if buf and (w.end - line_start) >= line_gap:
-            lines.append(f"[{line_start:.1f}-{line_end:.1f}] {' '.join(buf)}")
+        if buf and (w.start - line_start) >= seg_seconds:
+            out.append(f"[{line_start:.1f}-{line_end:.1f}] {' '.join(buf[:max_words])}")
             buf = []
             line_start = w.start
         buf.append(w.word)
         line_end = w.end
     if buf:
-        lines.append(f"[{line_start:.1f}-{line_end:.1f}] {' '.join(buf)}")
-    return "\n".join(lines)
+        out.append(f"[{line_start:.1f}-{line_end:.1f}] {' '.join(buf[:max_words])}")
+    return out
+
+
+# Шкала «плотности» транскрипта от подробной к разреженной: (сек_на_блок, слов_на_блок).
+# Берём самую подробную раскладку, которая влезает в бюджет символов.
+_DENSITY = (
+    (6, 9999), (10, 9999), (15, 20), (25, 16),
+    (40, 14), (60, 12), (90, 10), (150, 8),
+)
+
+
+def _build_timestamped_text(words: list[Word], max_chars: int = MAX_LLM_CHARS) -> str:
+    """Собрать транскрипт с таймкодами, уложившись в бюджет символов max_chars."""
+    if not words:
+        return ""
+    text = ""
+    for seg, mw in _DENSITY:
+        text = "\n".join(_lines(words, seg, mw))
+        if len(text) <= max_chars:
+            return text
+    return text[:max_chars]  # даже самый разреженный не влез — жёстко обрезаем
 
 
 def _clamp_to_words(start: float, end: float, words: list[Word]) -> tuple[float, float]:
@@ -60,18 +90,8 @@ def _clamp_to_words(start: float, end: float, words: list[Word]) -> tuple[float,
     return near_start, near_end
 
 
-def select_clips(
-    transcript: Transcript,
-    video_duration: float,
-    api_key: str,
-    count: int,
-) -> list[dict]:
-    """Вернуть список {start, end, reason}. Всегда хотя бы один валидный фрагмент."""
-    ts_text = _build_timestamped_text(transcript.words)
-    if not ts_text:
-        raise SelectError("Пустой транскрипт — нечего выбирать.")
-
-    want = max(3, min(5, count if count else 3))
+def _call_groq(ts_text: str, video_duration: float, want: int, api_key: str):
+    """Один запрос к Groq LLM. Возвращает (status_code, parsed_or_None, text_tail)."""
     system = (
         "Ты монтажёр коротких вертикальных видео (Reels/Shorts). "
         "Тебе дают транскрипт с таймкодами в секундах. "
@@ -87,7 +107,6 @@ def select_clips(
         f"Нужно {want} фрагментов по 30–60 секунд.\n\n"
         f"Транскрипт:\n{ts_text}"
     )
-
     body = {
         "model": MODEL,
         "temperature": 0.4,
@@ -99,28 +118,69 @@ def select_clips(
     }
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
-    try:
-        with httpx.Client(timeout=180) as client:
-            resp = client.post(GROQ_URL, headers=headers, json=body)
-    except httpx.HTTPError as exc:
-        log.exception("Сетевая ошибка при обращении к Groq LLM")
-        raise SelectError("Не удалось связаться с Groq (LLM). Попробуй позже.") from exc
+    with httpx.Client(timeout=180) as client:
+        resp = client.post(GROQ_URL, headers=headers, json=body)
 
     if resp.status_code != 200:
-        tail = resp.text[-1500:]
-        log.error("Groq chat %d: %s", resp.status_code, tail)
-        if resp.status_code in (401, 403):
-            raise SelectError("Groq отклонил ключ на этапе выбора моментов (401/403).")
-        if resp.status_code == 429:
-            raise SelectError("Groq лимит (429) на этапе выбора. Подожди минуту.")
-        raise SelectError(f"Groq вернул ошибку {resp.status_code} на выборе моментов.")
-
+        return resp.status_code, None, resp.text[-1500:]
     try:
         content = resp.json()["choices"][0]["message"]["content"]
-        parsed = json.loads(content)
-    except Exception as exc:  # noqa: BLE001
-        log.error("Не разобрать ответ LLM: %s", resp.text[:800])
-        raise SelectError("Groq вернул некорректный JSON на выборе моментов.") from exc
+        return 200, json.loads(content), ""
+    except Exception:  # noqa: BLE001
+        return 200, None, resp.text[:800]
+
+
+def select_clips(
+    transcript: Transcript,
+    video_duration: float,
+    api_key: str,
+    count: int,
+) -> list[dict]:
+    """Вернуть список {start, end, reason}. Всегда хотя бы один валидный фрагмент."""
+    if not transcript.words:
+        raise SelectError("Пустой транскрипт — нечего выбирать.")
+
+    want = max(3, min(5, count if count else 3))
+
+    # Длинное видео = длинный транскрипт. Если Groq отвечает 413 (запрос велик) —
+    # сжимаем транскрипт вдвое и повторяем.
+    parsed = None
+    budget = MAX_LLM_CHARS
+    for _ in range(4):
+        ts_text = _build_timestamped_text(transcript.words, budget)
+        if not ts_text:
+            raise SelectError("Пустой транскрипт — нечего выбирать.")
+        try:
+            status, parsed, tail = _call_groq(ts_text, video_duration, want, api_key)
+        except httpx.HTTPError as exc:
+            log.exception("Сетевая ошибка при обращении к Groq LLM")
+            raise SelectError("Не удалось связаться с Groq (LLM). Попробуй позже.") from exc
+
+        if status == 413:
+            budget = max(1500, budget // 2)
+            log.warning("Groq 413 (запрос велик) — сжимаю транскрипт до %d символов и повторяю.",
+                        budget)
+            parsed = None
+            continue
+        if status != 200:
+            log.error("Groq chat %d: %s", status, tail)
+            if status in (401, 403):
+                raise SelectError("Groq отклонил ключ на этапе выбора моментов (401/403).")
+            if status == 429:
+                raise SelectError("Groq лимит запросов (429) на этапе выбора. Подожди минуту.")
+            raise SelectError(f"Groq вернул ошибку {status} на выборе моментов.")
+        if parsed is None:
+            log.error("Не разобрать ответ LLM: %s", tail)
+            raise SelectError("Groq вернул некорректный JSON на выборе моментов.")
+        break
+
+    if parsed is None:
+        # Даже самый сжатый транскрипт не прошёл — берём фолбэк, чтобы клип всё равно был.
+        log.warning("Groq 413 на всех размерах транскрипта — использую фолбэк.")
+        fb = _fallback(transcript.words, video_duration)
+        if fb:
+            return fb
+        raise SelectError("Транскрипт слишком большой для Groq. Попробуй видео покороче.")
 
     raw = parsed.get("clips") if isinstance(parsed, dict) else parsed
     if not isinstance(raw, list):
