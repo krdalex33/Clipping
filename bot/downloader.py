@@ -74,8 +74,10 @@ def _base_opts(cfg: Config, workdir: str) -> dict:
         "no_warnings": True,
         "restrictfilenames": True,
         "noprogress": True,
-        # Клиенты YouTube, которые обычно меньше троттлят серверные IP.
-        "extractor_args": {"youtube": {"player_client": ["ios", "web"]}},
+        # ВАЖНО: используем cookie-совместимые клиенты. iOS/Android-клиенты быстрее,
+        # но ИГНОРИРУЮТ cookies, из-за чего с серверного IP YouTube отдаёт
+        # «видео недоступно». web/mweb/tv работают с нашими cookies.
+        "extractor_args": {"youtube": {"player_client": ["web", "mweb", "tv"]}},
         # Немного маскируемся под обычный клиент.
         "http_headers": {
             "User-Agent": (
