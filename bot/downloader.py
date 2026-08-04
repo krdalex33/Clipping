@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 
 import yt_dlp
@@ -20,6 +21,22 @@ log = logging.getLogger("clipping.downloader")
 
 MAX_SOURCE_SECONDS = 90 * 60  # 90 минут
 FORMAT = "bv*[height<=720]+ba/b[height<=720]/b"
+
+# Максимум времени на само скачивание. YouTube часто режет скорость для серверов
+# хостинга; без этого лимита бот висел бы на одной задаче бесконечно.
+DOWNLOAD_TIMEOUT = 8 * 60  # 8 минут
+_TIMEOUT_MARK = "clipping-download-timeout"
+
+
+class _Deadline:
+    """progress-hook для yt-dlp: прерывает слишком долгое скачивание."""
+
+    def __init__(self, seconds: float):
+        self.deadline = time.monotonic() + seconds
+
+    def __call__(self, status: dict) -> None:
+        if time.monotonic() > self.deadline:
+            raise yt_dlp.utils.DownloadError(_TIMEOUT_MARK)
 
 
 class DownloadError(RuntimeError):
@@ -49,10 +66,16 @@ def _base_opts(cfg: Config, workdir: str) -> dict:
         "noplaylist": True,
         "retries": 5,
         "fragment_retries": 5,
+        # Обрываем зависшее соединение вместо бесконечного ожидания.
+        "socket_timeout": 30,
+        # Качаем фрагменты параллельно — заметно быстрее на DASH-форматах.
+        "concurrent_fragment_downloads": 4,
         "quiet": True,
         "no_warnings": True,
         "restrictfilenames": True,
         "noprogress": True,
+        # Клиенты YouTube, которые обычно меньше троттлят серверные IP.
+        "extractor_args": {"youtube": {"player_client": ["ios", "web"]}},
         # Немного маскируемся под обычный клиент.
         "http_headers": {
             "User-Agent": (
@@ -70,6 +93,15 @@ def _base_opts(cfg: Config, workdir: str) -> dict:
 
 def _humanize(err_text: str) -> str:
     low = err_text.lower()
+    if _TIMEOUT_MARK in err_text or "timed out" in low or "timeout" in low:
+        return (
+            "Видео качается слишком медленно — YouTube режет скорость для серверов "
+            "хостинга. Что можно сделать:\n"
+            "• пришли ролик покороче (5–10 минут);\n"
+            "• обнови cookies (YT_COOKIES_B64);\n"
+            "• для стабильной скорости задай прокси в переменной YT_PROXY "
+            "(лучше резидентный)."
+        )
     if any(k in low for k in ("sign in to confirm", "not a bot", "confirm you", "cookies")):
         return (
             "YouTube требует авторизацию (антибот). Обнови cookies:\n"
@@ -118,9 +150,10 @@ def download(url: str, workdir: str, cfg: Config) -> DownloadResult:
             f"Пришли ролик покороче."
         )
 
-    # Шаг 2. Собственно скачивание.
+    # Шаг 2. Собственно скачивание — с дедлайном, чтобы не висеть вечно.
+    dl_opts = {**opts, "progress_hooks": [_Deadline(DOWNLOAD_TIMEOUT)]}
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with yt_dlp.YoutubeDL(dl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             path = ydl.prepare_filename(info)
     except yt_dlp.utils.DownloadError as exc:
