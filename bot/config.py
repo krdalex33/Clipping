@@ -70,14 +70,34 @@ def _require(name: str) -> str:
     return val
 
 
+def _binary_present(binary: str) -> bool:
+    return shutil.which(binary) is not None or os.path.isfile(binary)
+
+
+def _try_static_ffmpeg() -> None:
+    """Если системного ffmpeg нет (хостинг собрал не через Dockerfile) —
+    подтягиваем статические ffmpeg+ffprobe пакетом static-ffmpeg и добавляем в PATH.
+    Скачивание идёт один раз при первом старте."""
+    try:
+        import static_ffmpeg  # noqa: PLC0415 — импортируем лениво, только при нужде
+        log.info("Системный ffmpeg не найден — готовлю статический через static-ffmpeg…")
+        static_ffmpeg.add_paths()  # скачает при необходимости и допишет PATH
+        log.info("static-ffmpeg готов, ffmpeg/ffprobe добавлены в PATH.")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Не удалось подготовить static-ffmpeg: %s", exc)
+
+
 def check_ffmpeg() -> None:
     """Убеждаемся, что ffmpeg и ffprobe доступны. Иначе — падаем с инструкцией."""
+    if not (_binary_present(FFMPEG_BIN) and _binary_present(FFPROBE_BIN)):
+        _try_static_ffmpeg()
+
     for binary in (FFMPEG_BIN, FFPROBE_BIN):
-        if shutil.which(binary) is None and not os.path.isfile(binary):
+        if not _binary_present(binary):
             log.critical("Не найден %s.", binary)
             sys.exit(
-                f"ОШИБКА: не найден {binary}. В Docker он ставится строкой "
-                f"'apt-get install -y ffmpeg'. Проверьте Dockerfile."
+                f"ОШИБКА: не найден {binary}. Ожидался системный ffmpeg (Dockerfile: "
+                f"'apt-get install -y ffmpeg') или пакет static-ffmpeg из requirements.txt."
             )
     log.info("ffmpeg и ffprobe на месте.")
 
