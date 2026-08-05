@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import re
 import shutil
 import sys
 from dataclasses import dataclass
@@ -34,6 +35,22 @@ class Config:
     cookies_file: str | None  # путь к cookies.txt, если удалось раскодировать
 
 
+def _decode_blob(s: str) -> bytes:
+    """Раскодировать cookies из ENV. Поддерживаем hex, base64url и обычный base64 —
+    какой формат прошёл валидацию поля хостинга, такой и примем."""
+    s = "".join(s.split())  # убираем пробелы и переносы строк
+    # hex (только 0-9a-f) — самый «безопасный» для форм формат
+    if len(s) % 2 == 0 and re.fullmatch(r"[0-9a-fA-F]+", s):
+        try:
+            return bytes.fromhex(s)
+        except ValueError:
+            pass
+    # base64 / base64url (нормализуем и добиваем паддинг)
+    t = s.replace("-", "+").replace("_", "/")
+    t += "=" * (-len(t) % 4)
+    return base64.b64decode(t)
+
+
 def _decode_cookies() -> str | None:
     """YT_COOKIES_B64 -> /app/cookies.txt. Возвращает путь или None."""
     b64 = os.environ.get("YT_COOKIES_B64", "").strip()
@@ -41,7 +58,7 @@ def _decode_cookies() -> str | None:
         log.warning("YT_COOKIES_B64 не задан — YouTube может требовать авторизацию.")
         return None
     try:
-        raw = base64.b64decode(b64, validate=False)
+        raw = _decode_blob(b64)
         # Пытаемся записать в /app/cookies.txt; если каталог недоступен (локальный
         # запуск не в контейнере) — кладём рядом во временный файл.
         target = COOKIES_PATH
